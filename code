@@ -1,0 +1,109 @@
+import time
+import numpy as np
+import pandas as pd
+
+from tqdm import tqdm
+
+from sklearn.preprocessing import LabelEncoder
+
+import lightgbm as lgb
+
+paths = r'D:\ML'#修改路径即可
+train_data = pd.read_csv(f'{paths}/train.csv')
+test_data = pd.read_csv(f'{paths}/test.csv')
+submit_df = pd.read_csv(f'{paths}/submit_example.csv')
+
+display(train_data, test_data, example_data)
+
+
+#预处理
+for df in [train_data, test_data]:
+    # 处理空值
+    for f in ['category_code', 'brand']:
+        df[f].fillna('<unkown>', inplace=True)
+        
+    # 处理时间
+    df['event_time'] = pd.to_datetime(df['event_time'], format='%Y-%m-%d %H:%M:%S UTC')
+    df['timestamp'] = df['event_time'].apply(lambda x: time.mktime(x.timetuple()))
+    df['timestamp'] = df['timestamp'].astype(int)
+
+# 排序
+train_data = train_data.sort_values(['user_id', 'timestamp'])
+test_data = test_data.sort_values(['user_id', 'timestamp'])
+
+# 处理非数值特征
+df = pd.concat([train_data, test_data], ignore_index=True)
+
+for f in ['event_type', 'category_code', 'brand']:
+    # 构建编码器
+    le = LabelEncoder()
+    le.fit(df[f])
+
+    # 设置新值
+    train_data[f] = le.transform(train_data[f])
+    test_data[f] = le.transform(test_data[f])
+    
+# 删除无用列
+useless = ['event_time', 'user_session', 'timestamp']
+for df in [train_data, test_data]:
+    df.drop(columns=useless, inplace=True)
+
+#滑动窗口构造数据集
+#为了让机器学习模型能够处理时序数据，必须通过滑动窗口构造数据，后一个时间点的作为前一个时间点的预测值
+
+# 训练集数据生成：滑动窗口
+# 用前一个时间节点的数据预测后一个时间节点是商品
+train_df = pd.DataFrame()
+user_ids = train_data['user_id'].unique()
+for uid in tqdm(user_ids):
+    user_data = train_data[train_data['user_id'] == uid].copy(deep=True)
+    if user_data.shape[0] < 2:
+        # 小于两条的，直接忽略
+        continue
+
+    user_data['y'] = user_data['product_id'].shift(-1)
+    user_data = user_data.head(user_data.shape[0]-1)
+    train_df = train_df.append(user_data)
+
+train_df['y'] = train_df['y'].astype(int)
+train_df = train_df.reset_index(drop=True)
+
+# 测试集数据生成，只取每个用户最后一次操作用来做预测
+test_df = test_data.groupby(['user_id'], as_index=False).last()
+
+train_df.drop(columns=['user_id'], inplace=True)
+
+display(train_df, test_df)
+
+user_ids = test_df['user_id'].unique()
+
+preds = []#预测集
+for uid in tqdm(user_ids):
+    pids = test_data[test_data['user_id'] == uid]['product_id'].unique()
+
+    # 找到训练集中有这些product_id的数据作为当前用户的训练集
+    p_train = train_df[train_df['product_id'].isin(pids)]
+    
+    # 只取最后一条进行预测
+    user_test = test_df[test_df['user_id'] == uid].drop(columns=['user_id'])
+
+    X_train = p_train.iloc[:, :-1]
+    y_train = p_train['y']
+
+    if len(X_train) > 0:
+        # 训练
+        clf = lgb.LGBMClassifier(**{'seed': int(time.time())})
+        clf.fit(X_train, y_train)
+    
+        # 预测
+        pred = clf.predict(user_test)[0]
+    else:
+        # 训练集中无对应数据
+        # 直接取最后一条数据作为预测值
+        pred = user_test['product_id'].iloc[0]
+
+    preds.append(pred)
+
+submit_df['product_id'] = preds
+
+submit_df.to_csv('baseline.csv', index=False)
